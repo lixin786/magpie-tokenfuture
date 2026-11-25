@@ -29,11 +29,15 @@ copy(JSON.stringify({ access_token: localStorage.getItem('auth_token'), refresh_
 
 - **每日签到**：`/api/v1/user/checkin`。规则是连续 1→5 天递增、第 6 天起 5 额度、断签重头；北京时间 0 点更新。受 magpie「设置 → 用量 → 插件 → 每日签到」开关控制。
 - **余额**：`/v1/usage` 返回余额 + 每日消费，magpie 会记进余额走势。
-- **模型**：GPT-5.6 / GPT-6 / GPT-6.1 / GPT-6.2 系列共 12 个模型，支持 reasoning（low ~ xhigh；max 会落到 xhigh）。
+- **模型**：四渠道全支持，登录后自动给每个分组（渠道）配一把 key，模型名带倍率：
+  - **GPT**（5x）：gpt-5.6 / gpt-6 / gpt-6.1 / gpt-6.2 系列
+  - **DeepSeek**（0.7x）：deepseek-v4-flash / v4-pro / v4.1-flash（cn + global）
+  - **GLM**（0.8x）：glm-5.2 / glm-5.3 / glm-5.3-flash
+  - **Kimi**（0.8x）：kimi-k3-1 / kimi-k3.1-pro
 
 ## 说明
 
-- 不同账号的可用分组（倍率）不同，本插件取账号默认分组，不展开多分组。
+- 主分组（通常是 GPT）的模型用裸 id，其余分组的模型 id 带 `-g<分组id>` 后缀，请求时自动切换到该分组的 key。
 - 模型清单以网关实时返回为准，静态目录只作兜底。
 
 ## License

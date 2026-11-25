@@ -4,6 +4,9 @@
 //
 //   1) 模型调用走标准 Responses / Chat Completions（/v1 下），用面板里生成的
 //       API key（sk-…）鉴权，`Authorization: Bearer sk-…`。
+//       网关按「分组（渠道）」分模型：GPT / DeepSeek / GLM / Kimi 各一组，
+//       每组自己的模型清单和倍率（rate_multiplier），一把 key 只属一个分组。
+//       DeepSeek/GLM/Kimi 的模型 id 自带 `cn:` / `global:` 前缀。
 //
 //   2) 每日签到 + 余额在面板的 /api/v1 下，用网页登录的 JWT（auth_token）鉴权，
 //       API key 会被判 INVALID_API_KEY。面板登录被 Cloudflare Turnstile 挡着
@@ -13,17 +16,17 @@
 //   3) 签到规则（站点内固定）：连续第 1 天 1 额度、2 天 2、…、第 6 天起 5，
 //       中断一天后重新从第 1 天开始；每天北京时间 0 点更新，一账号一天一次。
 //
-// 这个插件只做三件事：签到（checkin）、余额（usage）、模型调用（provider）。
+// 这个插件做三件事：签到（checkin）、余额（usage）、模型调用（provider，多分组）。
 
 const PROVIDER = "tokenfuture"
 const BASE_URL = "https://tokenfuture.si/v1"
 const PANEL_BASE = "https://tokenfuture.si"
 const PANEL_PREFIX = "/api/v1"
 
-// 模型静态兜底清单（网关另有实时清单，provider.models 会按需拉取）。
-// context/output 取 GPT-6 系的目录值；codex-auto-review / gpt-reserve 无目录
-// 记录，用通用兜底。
+// 模型静态兜底清单（context/output 为目录估算值，实际调用以上游为准）。
+// 网关另报实时清单，provider.models 会按分组逐个拉取。
 const MODELS = {
+  // GPT（rate 5）
   "gpt-5.6-luna": { name: "GPT-5.6 Luna", context: 1050000, output: 128000 },
   "gpt-5.6-sol": { name: "GPT-5.6 Sol", context: 1050000, output: 128000 },
   "gpt-5.6-terra": { name: "GPT-5.6 Terra", context: 1050000, output: 128000 },
@@ -36,14 +39,24 @@ const MODELS = {
   "gpt-6.2-sol": { name: "GPT-6.2 Sol", context: 1050000, output: 128000 },
   "codex-auto-review": { name: "Codex Auto Review", context: 128000, output: 32768 },
   "gpt-reserve": { name: "GPT Reserve", context: 128000, output: 32768 },
+  // DeepSeek（rate 0.7）
+  "cn:deepseek-v4-flash": { name: "DeepSeek V4 Flash（国内）", context: 128000, output: 8192 },
+  "cn:deepseek-v4-pro": { name: "DeepSeek V4 Pro（国内）", context: 128000, output: 8192 },
+  "cn:deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash（国内）", context: 128000, output: 8192 },
+  "global:deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash（国际）", context: 128000, output: 8192 },
+  "global:deepseek-v4.1-flash-sg": { name: "DeepSeek V4.1 Flash SG（国际）", context: 128000, output: 8192 },
+  // GLM（rate 0.8）
+  "cn:glm-5.2": { name: "GLM-5.2", context: 200000, output: 8192 },
+  "cn:glm-5.3": { name: "GLM-5.3", context: 200000, output: 8192 },
+  "cn:glm-5.3-flash": { name: "GLM-5.3 Flash", context: 200000, output: 8192 },
+  // Kimi（rate 0.8）
+  "cn:kimi-k3-1": { name: "Kimi K3.1", context: 256000, output: 8192 },
+  "cn:kimi-k3.1-pro": { name: "Kimi K3.1 Pro", context: 256000, output: 8192 },
 }
 
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
 // ---- 面板 API 封装 -----------------------------------------------------
-//
-// 面板统一包一层 { code: 0, message: "success", data: {...} }，
-// 错误则是 { code, message, reason? }。这里拆成 { status, ok, data, reason, message }。
 async function panelRequest(path, options = {}) {
   const { token, method = "GET", body } = options
   const headers = { accept: "application/json" }
@@ -75,7 +88,6 @@ async function panelRequest(path, options = {}) {
   }
 }
 
-// 面板的分页返回形状各版本不一样，把可能的容器都摊平。
 function extractList(data) {
   if (Array.isArray(data)) return data
   if (!data || typeof data !== "object") return []
@@ -86,7 +98,6 @@ function extractList(data) {
   return []
 }
 
-// 用户粘贴的令牌可能是裸 token，也可能是浏览器 copy 出来的 JSON 块。
 function parseTokenInput(raw) {
   const text = String(raw ?? "").trim()
   if (!text) return { accessToken: "", refreshToken: "" }
@@ -113,68 +124,88 @@ function hasGroup(item) {
   return item?.group_id !== null && item?.group_id !== undefined
 }
 
-// 从账号里挑一把能用的 API key：
-//   1. 有分组且可用的 key 直接用；
-//   2. 有可用的孤儿 key（没有分组）给它补上默认分组；
-//   3. 都没有就新建一把（带默认分组）。
-async function resolvePanelApiKey(token) {
-  let list = []
-  try {
-    const res = await panelRequest("/keys", { token })
-    if (res.ok) list = extractList(res.data)
-  } catch {
-    // 列表拿不到就往下走
-  }
-
-  const usable = list.find((item) => isActiveKey(item) && hasGroup(item) && item?.key)
-  if (usable) return usable.key
-
-  // 取一个默认分组
-  let groupId = 0
+// ---- 分组（渠道）与 key -------------------------------------------------
+async function listGroups(token) {
   try {
     const res = await panelRequest("/groups/available", { token })
-    if (res.ok) {
-      const groups = Array.isArray(res.data) ? res.data : extractList(res.data)
-      const active = groups.find((g) => {
-        const s = String(g?.status ?? "").toLowerCase()
-        return s === "" || s === "active"
-      })
-      groupId = Number(active?.id) || 0
-    }
+    if (!res.ok) return []
+    const list = Array.isArray(res.data) ? res.data : extractList(res.data)
+    return list
+      .map((g) => ({
+        id: Number(g?.id),
+        name: typeof g?.name === "string" ? g.name : "",
+        rate: Number(g?.rate_multiplier ?? 1) || 1,
+      }))
+      .filter((g) => Number.isFinite(g.id))
   } catch {
-    // 拿不到分组就建一把不带分组的（或带 0）
+    return []
   }
+}
 
-  const orphan = list.find(
-    (item) => isActiveKey(item) && !hasGroup(item) && item?.key && item?.name === "magpie",
-  )
-  if (orphan && groupId && orphan.id) {
-    try {
-      const updated = await panelRequest(`/keys/${orphan.id}`, {
-        method: "PUT",
-        token,
-        body: { group_id: groupId },
-      })
-      if (updated.ok) {
-        const key = updated.data?.key ?? orphan.key
-        if (key) return key
-      }
-    } catch {
-      // 补不上就新建
-    }
-  }
-
+async function listPanelKeys(token) {
   try {
-    const created = await panelRequest("/keys", {
+    const res = await panelRequest("/keys", { token })
+    if (!res.ok) return []
+    return extractList(res.data)
+  } catch {
+    return []
+  }
+}
+
+async function createPanelKey(token, name, groupId) {
+  try {
+    const res = await panelRequest("/keys", {
       method: "POST",
       token,
-      body: { name: "magpie", ...(groupId ? { group_id: groupId } : {}) },
+      body: { name, group_id: groupId },
     })
-    if (created.ok && created.data?.key) return created.data.key
+    if (res.ok && res.data?.key) {
+      return { key: res.data.key, id: res.data.id, group_id: groupId }
+    }
   } catch {
     // 忽略
   }
-  return ""
+  return null
+}
+
+// 每个分组配一把 key：现成的优先，没有就建一把（名字 magpie-g<分组id>）。
+async function ensureGroupKeys(token) {
+  const groups = await listGroups(token)
+  if (!groups.length) return { groups: [], groupKeys: {}, keyGroups: {} }
+  const keys = await listPanelKeys(token)
+  const groupKeys = {}
+  const keyGroups = {}
+  for (const g of groups) {
+    const existing = keys.find(
+      (k) => Number(k?.group_id) === g.id && isActiveKey(k) && typeof k?.key === "string" && k.key,
+    )
+    if (existing) {
+      groupKeys[g.id] = existing.key
+      keyGroups[existing.key] = g.id
+      continue
+    }
+    const created = await createPanelKey(token, `magpie-g${g.id}`, g.id)
+    if (created) {
+      groupKeys[g.id] = created.key
+      keyGroups[created.key] = g.id
+    }
+  }
+  return { groups, groupKeys, keyGroups }
+}
+
+// 某个 key 能用的模型
+async function listModelsForKey(key) {
+  try {
+    const res = await fetch(`${BASE_URL}/models`, {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(15000),
+    })
+    if (!res.ok) return []
+    const body = await res.json()
+    return Array.isArray(body?.data) ? body.data : []
+  } catch {
+    return []
+  }
 }
 
 // 用 refresh_token 换一张新的面板会话。
@@ -199,9 +230,6 @@ async function refreshPanelSession(refreshToken) {
 }
 
 // ---- 凭据读取 ----------------------------------------------------------
-//
-// 这个插件只用一种登录方式：api 型（粘贴网页令牌）。key 存网关 API key（sk-…），
-// 面板令牌与 refresh_token 存 metadata。
 function apiKeyOf(auth) {
   return auth?.key ?? auth?.access ?? auth?.metadata?.apiKey ?? ""
 }
@@ -214,10 +242,46 @@ function refreshTokenOf(auth) {
   return auth?.refresh ?? auth?.metadata?.refreshToken ?? ""
 }
 
-// ---- 模型声明 ----------------------------------------------------------
+function groupKeysOf(auth) {
+  const value = auth?.metadata?.groupKeys
+  return value && typeof value === "object" ? value : {}
+}
+
+// ---- 模型声明与分组标记 ------------------------------------------------
+const GROUP_MARK = /-g(\d+)$/
+
+function rateLabel(rate) {
+  const n = Number(rate)
+  if (!Number.isFinite(n)) return "1x"
+  return String(n) + "x"
+}
+
+function modelInBody(text) {
+  try {
+    const body = JSON.parse(text)
+    return typeof body?.model === "string" ? body.model : null
+  } catch {
+    return null
+  }
+}
+
+function stripModelMark(text, raw) {
+  try {
+    const body = JSON.parse(text)
+    if (typeof body?.model === "string") body.model = raw.replace(GROUP_MARK, "")
+    return JSON.stringify(body)
+  } catch {
+    return text
+  }
+}
+
+function modelSpec(id) {
+  return MODELS[id] ?? { name: id, context: 128000, output: 8192 }
+}
+
 function modelEntry(spec, id) {
   const variants = {}
-  for (const effort of spec.efforts ?? EFFORTS) variants[effort] = {}
+  for (const effort of EFFORTS) variants[effort] = {}
   return {
     id,
     name: spec.name,
@@ -229,8 +293,8 @@ function modelEntry(spec, id) {
   }
 }
 
-function wireEntry(entry, { apiId, name } = {}) {
-  return {
+function wireEntry(entry, { apiId, name, rate } = {}) {
+  const out = {
     ...entry,
     id: apiId ?? entry.id,
     name: name ?? entry.name,
@@ -245,6 +309,8 @@ function wireEntry(entry, { apiId, name } = {}) {
     },
     variants: entry.variants ?? {},
   }
+  if (typeof rate === "number") out.rate = rate
+  return out
 }
 
 // Responses 请求体轻量改写：网关不接 store 链；推理档位 max/ultra 落到 xhigh。
@@ -268,22 +334,8 @@ function normalizeResponsesBody(text) {
   return JSON.stringify(body)
 }
 
-function modelInBody(text) {
-  try {
-    const body = JSON.parse(text)
-    return typeof body?.model === "string" ? body.model : null
-  } catch {
-    return null
-  }
-}
-
-function modelSpec(id) {
-  return MODELS[id] ?? { name: id, context: 128000, output: 32768 }
-}
-
 // 把签到状态翻译成 magpie 的 checkin 结果。
-// outcome: claimed / done / ineligible / inactive / captcha / failed
-function classifyCheckin(status, amount) {
+function classifyCheckin(status) {
   if (!status || typeof status !== "object") {
     return { outcome: "failed", message: "签到状态返回异常" }
   }
@@ -301,9 +353,9 @@ function classifyCheckin(status, amount) {
   }
   return {
     outcome: "claimed",
-    credit: typeof amount === "number" ? amount : undefined,
+    credit: Number.isFinite(Number(status.reward_amount)) ? Number(status.reward_amount) : undefined,
     streak: Number.isFinite(Number(status.total_days)) ? Number(status.total_days) : undefined,
-    message: `签到成功，获得 ${typeof amount === "number" ? amount : 0} 额度`,
+    message: `签到成功，获得 ${Number.isFinite(Number(status.reward_amount)) ? Number(status.reward_amount) : 0} 额度`,
   }
 }// ---- 主工厂 ------------------------------------------------------------
 export const TokenfuturePlugin = async (input) => {
@@ -367,9 +419,19 @@ export const TokenfuturePlugin = async (input) => {
               return { type: "failed", error: `无法访问面板：${String(err?.message ?? err)}` }
             }
 
-            // 自动选一把可用的 API key 给模型调用用。
-            const key = await resolvePanelApiKey(accessToken)
-            if (!key) {
+            // 每个分组（渠道）各配一把 key，模型清单能同时列出全部渠道。
+            let groupKeys = {}
+            let primaryGroup = 0
+            try {
+              const { groups, groupKeys: gk } = await ensureGroupKeys(accessToken)
+              groupKeys = gk
+              primaryGroup = groups[0]?.id ?? 0
+            } catch {
+              // 拿不到分组就退回主 key
+            }
+
+            const primaryKey = groupKeys[primaryGroup] ?? Object.values(groupKeys)[0] ?? ""
+            if (!primaryKey) {
               return {
                 type: "failed",
                 error: "没有取到可用的 API key，请到面板「API 密钥」页新建一把后重试",
@@ -378,12 +440,14 @@ export const TokenfuturePlugin = async (input) => {
 
             return {
               type: "success",
-              key,
+              key: primaryKey,
               accountId: email,
               metadata: {
                 email,
                 accessToken,
                 refreshToken,
+                groupKeys,
+                primaryGroup,
               },
             }
           },
@@ -391,7 +455,7 @@ export const TokenfuturePlugin = async (input) => {
       ],
 
       // 余额：网关 /v1/usage 返回 balance + daily_usage（顶层 balance 是关键，
-      // magpie 会记进 balance-history.json 画走势图）。失败退回面板 /auth/me。
+      // magpie 会记进 balance-history.json 画走势图）。
       async usage(getAuth) {
         const auth = await getAuth()
         const key = apiKeyOf(auth)
@@ -551,8 +615,23 @@ export const TokenfuturePlugin = async (input) => {
             let body = init?.body
             if (body != null && !String(headers.get("content-type") ?? "").includes("multipart")) {
               const text = typeof body === "string" ? body : new TextDecoder().decode(body)
-              const normalized = normalizeResponsesBody(text)
-              if (normalized !== text) {
+
+              // 模型 id 带分组标记时：换成那个分组的 key，并把标记去掉。
+              const model = modelInBody(text)
+              if (model) {
+                const m = GROUP_MARK.exec(model)
+                if (m) {
+                  const gkey = groupKeysOf(auth)[m[1]]
+                  if (gkey) headers.set("authorization", `Bearer ${gkey}`)
+                  const stripped = stripModelMark(text, model)
+                  if (stripped !== text) {
+                    body = typeof body === "string" ? stripped : new TextEncoder().encode(stripped)
+                  }
+                }
+              }
+
+              const normalized = normalizeResponsesBody(typeof body === "string" ? body : new TextDecoder().decode(body))
+              if (normalized !== (typeof body === "string" ? body : new TextDecoder().decode(body))) {
                 body = typeof body === "string" ? normalized : new TextEncoder().encode(normalized)
               }
             }
@@ -565,10 +644,51 @@ export const TokenfuturePlugin = async (input) => {
 
     provider: {
       id: PROVIDER,
-      async models(provider) {
-        // 实时拉网关的模型清单，逐个映射回静态目录（含 context/output）。
-        // 拉不到就用静态清单兜底。
-        return provider?.models ?? Object.fromEntries(
+      async models(provider, { auth } = {}) {
+        const key = apiKeyOf(auth)
+        if (!key) return provider?.models ?? {}
+
+        const token = String(panelTokenOf(auth) ?? "").trim()
+        const groupKeys = groupKeysOf(auth)
+        const primary = Number(auth?.metadata?.primaryGroup ?? 0)
+
+        // 有面板会话 + 多分组 key：每个分组都列出自己的模型，名字带倍率，
+        // 非主分组的模型 id 带 -g<分组id> 标记（loader 据此换 key）。
+        if (token && Object.keys(groupKeys).length) {
+          try {
+            const groups = await listGroups(token)
+            if (groups.length) {
+              const out = {}
+              const rateSeen = new Map()
+              for (const g of groups) {
+                const label = rateLabel(g.rate)
+                rateSeen.set(label, (rateSeen.get(label) ?? 0) + 1)
+              }
+              for (const g of groups) {
+                const gkey = groupKeys[g.id]
+                if (!gkey) continue
+                const rows = await listModelsForKey(gkey)
+                for (const row of rows) {
+                  const id = row?.id
+                  if (!id) continue
+                  const spec = modelSpec(id)
+                  const label = rateLabel(g.rate)
+                  const entryId = g.id === primary ? id : `${id}-g${g.id}`
+                  const name =
+                    `${spec?.name ?? row.display_name ?? id} · ${label}` +
+                    (rateSeen.get(label) > 1 && g.name ? `（${g.name}）` : "")
+                  out[entryId] = wireEntry(modelEntry(spec, id), { apiId: entryId, name, rate: g.rate })
+                }
+              }
+              if (Object.keys(out).length) return out
+            }
+          } catch {
+            // 拿不到分组就退回静态清单
+          }
+        }
+
+        // 没有多分组信息：退回静态清单（按主 key 兜底）。
+        return Object.fromEntries(
           Object.entries(MODELS).map(([id, spec]) => [id, wireEntry(modelEntry({ ...spec, efforts: EFFORTS }, id))]),
         )
       },
