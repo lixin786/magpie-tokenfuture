@@ -1,0 +1,31 @@
+{
+  "name": "magpie-tokenfuture",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: TokenFuture (tokenfuture.si) OpenAI-compatible gateway with browser-token sign-in, daily check-in and balance",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "icon.svg"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "magpie-plugin",
+    "tokenfuture",
+    "provider",
+    "checkin"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "name": "TokenFuture",
+    "icon": "https://tokenfuture.si/favicon.png",
+    "summary": {
+      "en": "TokenFuture (tokenfuture.si) OpenAI-compatible gateway: paste a browser token once for auto daily check-in + balance, and call GPT models.",
+      "zh": "TokenFuture（tokenfuture.si）OpenAI 兼容网关：粘贴一次网页令牌即可每日自动签到 + 查余额，并调用 GPT 系列模型。"
+    }
+  }
+}
